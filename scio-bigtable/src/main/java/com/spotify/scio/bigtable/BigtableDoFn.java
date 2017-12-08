@@ -66,7 +66,6 @@ public abstract class BigtableDoFn<A, B> extends DoFn<A, KV<A, B>> {
   private final Semaphore semaphore;
   private final ConcurrentMap<UUID, ListenableFuture<B>> futures = Maps.newConcurrentMap();
   private final ConcurrentLinkedQueue<Result> results = Queues.newConcurrentLinkedQueue();
-  private final ConcurrentLinkedQueue<Throwable> errors = Queues.newConcurrentLinkedQueue();
   private long requestCount;
   private long resultCount;
 
@@ -132,7 +131,6 @@ public abstract class BigtableDoFn<A, B> extends DoFn<A, KV<A, B>> {
     LOG.info("Start bundle for {}", this);
     futures.clear();
     results.clear();
-    errors.clear();
     requestCount = 0;
     resultCount = 0;
   }
@@ -170,26 +168,14 @@ public abstract class BigtableDoFn<A, B> extends DoFn<A, KV<A, B>> {
     Futures.addCallback(future, new FutureCallback<B>() {
       @Override
       public void onSuccess(@Nullable B result) {
+        cacheSupplier.put(instanceId, input, result);
+        results.add(new Result(input, result, c.timestamp(), window));
         semaphore.release();
       }
 
       @Override
       public void onFailure(Throwable t) {
         semaphore.release();
-        errors.add(t);
-        futures.remove(uuid);
-      }
-    });
-
-    // Handle success
-    ListenableFuture<B> f = Futures.transform(future, new Function<B, B>() {
-      @Nullable
-      @Override
-      public B apply(@Nullable B output) {
-        cacheSupplier.put(instanceId, input, output);
-        results.add(new Result(input, output, c.timestamp(), window));
-        futures.remove(uuid);
-        return output;
       }
     });
 
@@ -197,7 +183,7 @@ public abstract class BigtableDoFn<A, B> extends DoFn<A, KV<A, B>> {
     // or the error would've already been pushed to the corresponding queues and we are not losing
     // data. `waitForFutures` in `finishBundle` blocks until all pending futures, including ones
     // that may have already completed, and `startBundle` clears everything.
-    futures.put(uuid, f);
+    futures.put(uuid, future);
   }
 
   @FinishBundle
@@ -224,16 +210,6 @@ public abstract class BigtableDoFn<A, B> extends DoFn<A, KV<A, B>> {
 
   // Flush pending errors and results
   private void flush(Consumer<Result> outputFn) {
-    if (!errors.isEmpty()) {
-      RuntimeException e = new RuntimeException("Failed to process futures");
-      Throwable t = errors.poll();
-      while (t != null) {
-        e.addSuppressed(t);
-        t = errors.poll();
-      }
-      LOG.error("Failed to process futures", e);
-      throw e;
-    }
     Result r = results.poll();
     while (r != null) {
       outputFn.accept(r);
