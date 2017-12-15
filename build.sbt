@@ -62,6 +62,7 @@ val shapelessDatatypeVersion = "0.1.7"
 val slf4jVersion = "1.7.25"
 val sparkeyVersion = "2.1.3"
 val tensorFlowVersion = "1.3.0"
+val simulacrumVersion = "0.11.0"
 
 val commonSettings = Sonatype.sonatypeSettings ++ assemblySettings ++ Seq(
   organization       := "com.spotify",
@@ -349,15 +350,16 @@ lazy val scioBigtable: Project = Project(
   "scio-bigtable",
   file("scio-bigtable")
 ).settings(
-  commonSettings ++ itSettings,
+  commonSettings ++ itSettings ++ macroSettings,
   description := "Scio add-on for Google Cloud Bigtable",
   libraryDependencies ++= Seq(
     "org.apache.beam" % "beam-sdks-java-io-google-cloud-platform" % beamVersion,
+    "com.github.mpilquist" %% "simulacrum" % simulacrumVersion,
     "org.scalatest" %% "scalatest" % scalatestVersion % "test"
   )
 ).dependsOn(
   scioCore,
-  scioTest % "it"
+  scioTest
 ).configs(IntegrationTest)
 
 lazy val scioCassandra2: Project = Project(
