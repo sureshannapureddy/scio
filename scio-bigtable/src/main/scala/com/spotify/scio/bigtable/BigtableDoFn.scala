@@ -46,26 +46,26 @@ object BigtableDoFn {
   type WindowLookup[I, O] = ValueInSingleWindow[Lookup[I, O]]
 
   def apply[I, O](options: BigtableOptions)(lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] = {
-    val sessionFn = (uuid: UUID) =>
-      Resource[BigtableSession]
-        .get(uuid.toString, () => new BigtableSession(options))
+    val clientFn = (uuid: UUID) =>
+      Resource[BigtableDataClient]
+        .get(uuid.toString, () => new BigtableSession(options).createAsyncExecutor().getClient)
     val cacheFn = (uuid: UUID) =>
       Resource[Cache[I, O]]
         .get(uuid.toString, () => new NoOpCache[I, O]())
 
-    BigtableDoFn[I, O](sessionFn, cacheFn)(lookupFn)
+    BigtableDoFn[I, O](clientFn, cacheFn)(lookupFn)
   }
 
   def apply[I, O](options: BigtableOptions, cache: Cache[I, O])(
       lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] = {
-    val sessionFn = (uuid: UUID) =>
-      Resource[BigtableSession]
-        .get(uuid.toString, () => new BigtableSession(options))
+    val clientFn = (uuid: UUID) =>
+      Resource[BigtableDataClient]
+        .get(uuid.toString, () => new BigtableSession(options).getDataClient)
     val cacheFn = (uuid: UUID) =>
       Resource[Cache[I, O]]
         .get(uuid.toString, () => cache)
 
-    BigtableDoFn[I, O](sessionFn, cacheFn)(lookupFn)
+    BigtableDoFn[I, O](clientFn, cacheFn)(lookupFn)
   }
 
   // probably move this to Utils?
@@ -81,7 +81,7 @@ object BigtableDoFn {
   }
 }
 
-case class BigtableDoFn[I, O](sessionFn: UUID => BigtableSession, cacheFn: UUID => Cache[I, O])(
+case class BigtableDoFn[I, O](clientFn: UUID => BigtableDataClient, cacheFn: UUID => Cache[I, O])(
     lookupFn: LookupFn[I, O])
     extends DoFn[I, Lookup[I, O]] {
 
@@ -98,12 +98,12 @@ case class BigtableDoFn[I, O](sessionFn: UUID => BigtableSession, cacheFn: UUID 
   def processElement(ctx: ProcessContext, window: BoundedWindow): Unit = {
     val input: I = ctx.element()
     val cache = cacheFn(instanceId)
-    val session = sessionFn(instanceId)
+    val client = clientFn(instanceId)
 
     val lookup = Option(cache.getIfPresent(input))
       .map(Future.successful)
       .getOrElse {
-        lookupFn(session.getDataClient, input).map { value =>
+        lookupFn(client, input).map { value =>
           cache.put(input, value)
           value
         }
@@ -145,10 +145,10 @@ object Resource {
       cache.asInstanceOf[Cache[K, B]]
     }
 
-  private val Sessions = new ConcurrentHashMap[String, BigtableSession]()
+  private val Clients = new ConcurrentHashMap[String, BigtableDataClient]()
 
-  implicit def bigtableSession: Resource[BigtableSession] =
-    (resourceId, builder) => Sessions.computeIfAbsent(resourceId, _ => builder())
+  implicit def bigtableClient: Resource[BigtableDataClient] =
+    (resourceId, builder) => Clients.computeIfAbsent(resourceId, _ => builder())
 }
 
 class NoOpCache[I, O] extends Cache[I, O] {
