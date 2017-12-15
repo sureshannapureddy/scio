@@ -18,14 +18,19 @@
 import com.google.bigtable.v2.{ReadRowsRequest, RowFilter, RowSet}
 import com.google.cloud.bigtable.config.BigtableOptions
 import com.google.cloud.bigtable.grpc.scanner.FlatRow
-import com.google.cloud.bigtable.grpc.{BigtableInstanceName, BigtableSession}
+import com.google.cloud.bigtable.grpc.{BigtableDataClient, BigtableInstanceName, BigtableSession}
 import com.google.common.cache.CacheBuilder
 import com.google.common.util.concurrent.{Futures, ListenableFuture}
 import com.google.protobuf.ByteString
 import com.spotify.scio._
 import com.spotify.scio.bigtable._
+import com.spotify.scio.bigtable.BigtableDoFn._
 import org.apache.beam.sdk.transforms.DoFn.ProcessElement
 import org.apache.beam.sdk.transforms.{DoFn, ParDo}
+
+import scala.concurrent.{Await, Future}
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.Duration
 
 object BigtableBenchmark {
   val projectId: String = "scio-playground"
@@ -41,12 +46,15 @@ object BigtableBenchmark {
   val familyName: String = "side"
   val columnQualifier: ByteString = ByteString.copyFromUtf8("value")
 
-  val readRowsRequestBuilder: ReadRowsRequest.Builder = ReadRowsRequest.newBuilder()
+  val readRowsRequestBuilder: ReadRowsRequest.Builder = ReadRowsRequest
+    .newBuilder()
     .setTableName(new BigtableInstanceName(projectId, instanceId).toTableNameStr(tableId))
-    .setFilter(RowFilter.newBuilder()
-      .setFamilyNameRegexFilter(familyName)
-      .setColumnQualifierRegexFilter(columnQualifier))
-      .setRowsLimit(1L)
+    .setFilter(
+      RowFilter
+        .newBuilder()
+        .setFamilyNameRegexFilter(familyName)
+        .setColumnQualifierRegexFilter(columnQualifier))
+    .setRowsLimit(1L)
 
   val lowerLetters: Seq[String] = (0 until 26).map('a'.toInt + _).map(_.toChar.toString)
   val upperLetters: Seq[String] = lowerLetters.map(_.toUpperCase)
@@ -64,26 +72,24 @@ object BigtableBenchmark {
     }
   }
 
-  def bigtableLookup(session: BigtableSession, input: String): ListenableFuture[String] = {
+  def bigtableLookup(client: BigtableDataClient, input: String): Future[String] = {
     val s = input
     val key = ByteString.copyFromUtf8(s"key-$s")
     val expected = ByteString.copyFromUtf8(s"val-$s")
     val request = readRowsRequestBuilder
       .setRows(RowSet.newBuilder().addRowKeys(key).build())
       .build()
-    val future = session.getDataClient.readFlatRowsAsync(request)
-    Futures.transform(future,
-      new com.google.common.base.Function[java.util.List[FlatRow], String] {
-        override def apply(input: java.util.List[FlatRow]) = {
-          val result = input
-          assert(result.size() == 1)
-          val cells = result.get(0).getCells
-          assert(result.get(0).getCells.size() == 1)
-          val value = cells.get(0).getValue
-          assert(value == expected)
-          value.toStringUtf8
-        }
-      })
+    client.readFlatRowsAsync(request).asScala.transform { resultTry =>
+      resultTry.map { input =>
+        val result = input
+        assert(result.size() == 1)
+        val cells = result.get(0).getCells
+        assert(result.get(0).getCells.size() == 1)
+        val value = cells.get(0).getValue
+        assert(value == expected)
+        value.toStringUtf8
+      }
+    }
   }
 }
 
@@ -114,9 +120,8 @@ object AsyncBigtableRead {
 
     sc.parallelize(letters)
       .applyTransform(ParDo.of(new FillDoFn(1000000)))
-      .applyTransform(ParDo.of(new BigtableDoFn[String, String](bigtableOptions, 10000) {
-        override def asyncLookup(session: BigtableSession, input: String) =
-          bigtableLookup(session, input)
+      .applyTransform(ParDo.of(BigtableDoFn[String, String](bigtableOptions) {
+        case (client, input) => bigtableLookup(client, input)
       }))
       .count
     sc.close()
@@ -129,26 +134,22 @@ object AsyncCachingBigtableRead {
     import BigtableBenchmark._
     val (sc, args) = ContextAndArgs(cmdlineArgs)
 
-    val cache = new BigtableDoFn.CacheSupplier[String, String, String] {
-      override def createCache() = CacheBuilder.newBuilder()
+    val cache =  CacheBuilder.newBuilder()
         .maximumSize(1000000)
         .build[String, String]()
-      override def getKey(input: String) = input
-    }
 
     sc.parallelize(letters)
       .applyTransform(ParDo.of(new FillDoFn(1)))
       .flatMap(s => Seq.fill(1000000)(s))
-      .applyTransform(ParDo.of(new BigtableDoFn[String, String](bigtableOptions, 10000, cache) {
-        override def asyncLookup(session: BigtableSession, input: String) =
-          bigtableLookup(session, input)
+      .applyTransform(ParDo.of(BigtableDoFn[String, String](bigtableOptions, cache) {
+        case (client, input) => bigtableLookup(client, input)
       }))
       .count
     sc.close()
   }
 }
 
-// Blocking key value lookup
+//// Blocking key value lookup
 object BlockingBigtableRead {
   def main(cmdlineArgs: Array[String]): Unit = {
     import BigtableBenchmark._
@@ -156,11 +157,10 @@ object BlockingBigtableRead {
 
     sc.parallelize(letters)
       .applyTransform(ParDo.of(new FillDoFn(1000000)))
-      .applyTransform(ParDo.of(new BigtableDoFn[String, String](bigtableOptions) {
-        override def asyncLookup(session: BigtableSession, input: String) = {
-          val output = bigtableLookup(session, input).get()
-          Futures.immediateFuture(output)
-        }
+      .applyTransform(ParDo.of(BigtableDoFn[String, String](bigtableOptions) {
+        case (client, input) =>
+          val output = Await.result(bigtableLookup(client, input), Duration.Inf)
+          Future.successful(output)
       }))
       .count
     sc.close()
@@ -173,21 +173,17 @@ object BlockingCachingBigtableRead {
     import BigtableBenchmark._
     val (sc, args) = ContextAndArgs(cmdlineArgs)
 
-    val cache = new BigtableDoFn.CacheSupplier[String, String, String] {
-      override def createCache() = CacheBuilder.newBuilder()
-        .maximumSize(1000000)
-        .build[String, String]()
-      override def getKey(input: String) = input
-    }
+    val cache =  CacheBuilder.newBuilder()
+      .maximumSize(1000000)
+      .build[String, String]()
 
     sc.parallelize(letters)
       .applyTransform(ParDo.of(new FillDoFn(1)))
       .flatMap(s => Seq.fill(1000000)(s))
-      .applyTransform(ParDo.of(new BigtableDoFn[String, String](bigtableOptions) {
-        override def asyncLookup(session: BigtableSession, input: String) = {
-          val output = bigtableLookup(session, input).get()
-          Futures.immediateFuture(output)
-        }
+      .applyTransform(ParDo.of(BigtableDoFn[String, String](bigtableOptions, cache) {
+        case (client, input) =>
+          val output = Await.result(bigtableLookup(client, input), Duration.Inf)
+          Future.successful(output)
       }))
       .count
     sc.close()

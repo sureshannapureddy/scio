@@ -17,51 +17,50 @@
 
 package com.spotify.scio.bigtable
 
-import com.google.cloud.bigtable.grpc.BigtableSession
+import java.util.UUID
+
 import com.google.common.cache.{Cache, CacheBuilder}
-import com.google.common.util.concurrent.{Futures, ListenableFuture}
-import com.spotify.scio.bigtable.BigtableDoFn.CacheSupplier
 import org.apache.beam.sdk.transforms.DoFnTester
 import org.apache.beam.sdk.values.KV
 import org.scalatest._
 
 import scala.collection.mutable
 import scala.collection.JavaConverters._
+import scala.concurrent.Future
 
 class BigtableDoFnTest extends FlatSpec with Matchers {
 
   "BigtableDoFn" should "work" in {
-    val fn = new TestBigtableDoFn
+    val fn =
+      BigtableDoFn[Int, String]((_: UUID) => null, (_: UUID) => BigtableDoFnTest.noOpCache) {
+        case (client, input) => Future.successful(input.toString)
+      }
     val output = DoFnTester.of(fn).processBundle((1 to 10).asJava)
-    output shouldBe (1 to 10).map(x => KV.of(x, x.toString)).asJava
+    output shouldBe (1 to 10).map(x => KV.of(x, Right(x.toString))).asJava
   }
 
   it should "work with cache" in {
-    val fn = new TestCachingBigtableDoFn
-    val output = DoFnTester.of(fn).processBundle(((1 to 10) ++ (5 to 15)).asJava)
-    output shouldBe ((1 to 10) ++ (5 to 15)).map(x => KV.of(x, x.toString)).asJava
-    BigtableDoFnTest.queue shouldBe (1 to 15)
+
+    val fn = BigtableDoFn[java.lang.Integer, String]((_: UUID) => null,
+                                                     (_: UUID) => BigtableDoFnTest.cache) {
+      case (client, input) =>
+        BigtableDoFnTest.queue.enqueue(input)
+        Future.successful(input.toString)
+    }
+
+    val input = ((1 to 10) ++ (5 to 15)).map(a => new Integer(a)).asJava
+    val output = DoFnTester.of(fn).processBundle(input)
+    output shouldBe ((1 to 10) ++ (5 to 15)).map(x => KV.of(x, Right(x.toString))).asJava
+
+    BigtableDoFnTest.queue.dequeueAll(_ => true)
+    DoFnTester.of(fn).processBundle(input)
+    BigtableDoFnTest.queue shouldBe mutable.Queue.empty
   }
 }
 
 object BigtableDoFnTest {
   val queue: mutable.Queue[Int] = mutable.Queue.empty
-}
-
-class TestBigtableDoFn extends BigtableDoFn[Int, String](null) {
-  override def asyncLookup(session: BigtableSession, input: Int): ListenableFuture[String] =
-    Futures.immediateFuture(input.toString)
-}
-
-class TestCachingBigtableDoFn extends BigtableDoFn[Int, String](null, 100, new TestCacheSupplier) {
-  override def asyncLookup(session: BigtableSession, input: Int): ListenableFuture[String] = {
-    BigtableDoFnTest.queue.enqueue(input)
-    Futures.immediateFuture(input.toString)
-  }
-}
-
-class TestCacheSupplier extends CacheSupplier[Int, String, java.lang.Long] {
-  override def createCache(): Cache[java.lang.Long, String] =
-    CacheBuilder.newBuilder().build[java.lang.Long, String]()
-  override def getKey(input: Int): java.lang.Long = input.toLong
+  val noOpCache: NoOpCache[Int, String] = new NoOpCache[Int, String]()
+  val cache: Cache[java.lang.Integer, String] =
+    CacheBuilder.newBuilder().build[java.lang.Integer, String]()
 }
