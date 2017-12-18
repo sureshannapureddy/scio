@@ -17,10 +17,8 @@
 
 import com.google.bigtable.v2.{ReadRowsRequest, RowFilter, RowSet}
 import com.google.cloud.bigtable.config.BigtableOptions
-import com.google.cloud.bigtable.grpc.scanner.FlatRow
-import com.google.cloud.bigtable.grpc.{BigtableDataClient, BigtableInstanceName, BigtableSession}
+import com.google.cloud.bigtable.grpc.{BigtableDataClient, BigtableInstanceName}
 import com.google.common.cache.CacheBuilder
-import com.google.common.util.concurrent.{Futures, ListenableFuture}
 import com.google.protobuf.ByteString
 import com.spotify.scio._
 import com.spotify.scio.bigtable._

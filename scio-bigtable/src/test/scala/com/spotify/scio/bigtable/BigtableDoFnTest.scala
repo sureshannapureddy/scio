@@ -17,8 +17,6 @@
 
 package com.spotify.scio.bigtable
 
-import java.util.UUID
-
 import com.google.common.cache.{Cache, CacheBuilder}
 import org.apache.beam.sdk.transforms.DoFnTester
 import org.apache.beam.sdk.values.KV
@@ -31,18 +29,15 @@ import scala.concurrent.Future
 class BigtableDoFnTest extends FlatSpec with Matchers {
 
   "BigtableDoFn" should "work" in {
-    val fn =
-      BigtableDoFn[Int, String]((_: UUID) => null, (_: UUID) => BigtableDoFnTest.noOpCache) {
-        case (client, input) => Future.successful(input.toString)
-      }
+    val fn = BigtableDoFn[Int, String](null, None) {
+      case (client, input) => Future.successful(input.toString)
+    }
     val output = DoFnTester.of(fn).processBundle((1 to 10).asJava)
     output shouldBe (1 to 10).map(x => KV.of(x, Right(x.toString))).asJava
   }
 
   it should "work with cache" in {
-
-    val fn = BigtableDoFn[java.lang.Integer, String]((_: UUID) => null,
-                                                     (_: UUID) => BigtableDoFnTest.cache) {
+    val fn = BigtableDoFn[java.lang.Integer, String](null, Some(BigtableDoFnTest.cache)) {
       case (client, input) =>
         BigtableDoFnTest.queue.enqueue(input)
         Future.successful(input.toString)
@@ -60,7 +55,6 @@ class BigtableDoFnTest extends FlatSpec with Matchers {
 
 object BigtableDoFnTest {
   val queue: mutable.Queue[Int] = mutable.Queue.empty
-  val noOpCache: NoOpCache[Int, String] = new NoOpCache[Int, String]()
   val cache: Cache[java.lang.Integer, String] =
     CacheBuilder.newBuilder().build[java.lang.Integer, String]()
 }

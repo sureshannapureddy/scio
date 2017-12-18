@@ -16,14 +16,12 @@
  */
 package com.spotify.scio.bigtable
 
-import java.{lang, util}
 import java.util.UUID
-import java.util.concurrent.{Callable, ConcurrentHashMap, ConcurrentLinkedQueue, ConcurrentMap}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
 
 import com.google.cloud.bigtable.config.BigtableOptions
 import com.google.cloud.bigtable.grpc.{BigtableDataClient, BigtableSession}
-import com.google.common.cache.{Cache, CacheStats}
-import com.google.common.collect.ImmutableMap
+import com.google.common.cache.Cache
 import com.google.common.util.concurrent.{FutureCallback, Futures, ListenableFuture}
 import com.spotify.scio.bigtable.BigtableDoFn._
 import org.apache.beam.sdk.transforms.DoFn
@@ -39,34 +37,23 @@ import scala.concurrent.{Await, Future, Promise}
 import scala.language.implicitConversions
 
 object BigtableDoFn {
-  import Resource._
-
   type LookupFn[I, O] = (BigtableDataClient, I) => Future[O]
   type Lookup[I, O] = KV[I, Either[Throwable, O]]
   type WindowLookup[I, O] = ValueInSingleWindow[Lookup[I, O]]
 
-  def apply[I, O](options: BigtableOptions)(lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] = {
-    val clientFn = (uuid: UUID) =>
-      Resource[BigtableDataClient]
-        .get(uuid.toString, () => new BigtableSession(options).createAsyncExecutor().getClient)
-    val cacheFn = (uuid: UUID) =>
-      Resource[Cache[I, O]]
-        .get(uuid.toString, () => new NoOpCache[I, O]())
+  private val DefaultClient = (options: BigtableOptions) =>
+    new BigtableSession(options).createAsyncExecutor().getClient
 
-    BigtableDoFn[I, O](clientFn, cacheFn)(lookupFn)
-  }
+  def apply[I, O](options: BigtableOptions)(lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] =
+    BigtableDoFn[I, O](DefaultClient(options), None)(lookupFn)
 
   def apply[I, O](options: BigtableOptions, cache: Cache[I, O])(
-      lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] = {
-    val clientFn = (uuid: UUID) =>
-      Resource[BigtableDataClient]
-        .get(uuid.toString, () => new BigtableSession(options).getDataClient)
-    val cacheFn = (uuid: UUID) =>
-      Resource[Cache[I, O]]
-        .get(uuid.toString, () => cache)
+      lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] =
+    BigtableDoFn[I, O](DefaultClient(options), Some(cache))(lookupFn)
 
-    BigtableDoFn[I, O](clientFn, cacheFn)(lookupFn)
-  }
+  def apply[I, O](client: => BigtableDataClient, cache: => Option[Cache[I, O]])(
+      lookupFn: LookupFn[I, O]): BigtableDoFn[I, O] =
+    new BigtableDoFn[I, O](client, cache, lookupFn)
 
   // probably move this to Utils?
   implicit class RichListenableFuture[T](lf: ListenableFuture[T]) {
@@ -74,6 +61,7 @@ object BigtableDoFn {
       val p = Promise[T]()
       Futures.addCallback(lf, new FutureCallback[T] {
         def onFailure(t: Throwable): Unit = p.failure(t)
+
         def onSuccess(result: T): Unit = p.success(result)
       })
       p.future
@@ -81,13 +69,21 @@ object BigtableDoFn {
   }
 }
 
-case class BigtableDoFn[I, O](clientFn: UUID => BigtableDataClient, cacheFn: UUID => Cache[I, O])(
-    lookupFn: LookupFn[I, O])
+class BigtableDoFn[I, O] private (client: => BigtableDataClient,
+                                  cache: => Option[Cache[I, O]],
+                                  lookupFn: LookupFn[I, O])
     extends DoFn[I, Lookup[I, O]] {
+
+  import BigtableResources._
 
   private[this] val instanceId = UUID.randomUUID()
   @transient private[this] lazy val lookups =
     new ConcurrentLinkedQueue[Future[WindowLookup[I, O]]]()
+  @transient private[this] lazy val clientResource =
+    Resource[BigtableDataClient].get(instanceId.toString, client)
+  @transient private[this] lazy val cacheResource = cache.map { value =>
+    Resource[Cache[I, O]].get(instanceId.toString, value)
+  }
 
   @StartBundle
   def startBundle(): Unit = {
@@ -97,17 +93,18 @@ case class BigtableDoFn[I, O](clientFn: UUID => BigtableDataClient, cacheFn: UUI
   @ProcessElement
   def processElement(ctx: ProcessContext, window: BoundedWindow): Unit = {
     val input: I = ctx.element()
-    val cache = cacheFn(instanceId)
-    val client = clientFn(instanceId)
-
-    val lookup = Option(cache.getIfPresent(input))
-      .map(Future.successful)
-      .getOrElse {
-        lookupFn(client, input).map { value =>
-          cache.put(input, value)
-          value
-        }
+    val lookup = cacheResource
+      .map { cache =>
+        Option(cache.getIfPresent(input))
+          .map(Future.successful)
+          .getOrElse {
+            lookupFn(clientResource, input).map { value =>
+              cache.put(input, value)
+              value
+            }
+          }
       }
+      .getOrElse(lookupFn(clientResource, input))
       .transform { result =>
         result.map { _ =>
           val kv = KV.of(input, result.toEither)
@@ -132,47 +129,21 @@ case class BigtableDoFn[I, O](clientFn: UUID => BigtableDataClient, cacheFn: UUI
 }
 
 @typeclass trait Resource[T] {
-  def get(resourceId: String, builder: () => T): T
+  def get(resourceId: String, builder: => T): T
 }
 
-object Resource {
+object BigtableResources {
   private val Caches = new ConcurrentHashMap[String, Cache[_, _]]()
 
   implicit def guavaResource[K, B]: Resource[Cache[K, B]] =
     (resourceId, builder) => {
       val cache =
-        Caches.computeIfAbsent(resourceId, _ => builder().asInstanceOf[Cache[_, _]])
+        Caches.computeIfAbsent(resourceId, _ => builder.asInstanceOf[Cache[_, _]])
       cache.asInstanceOf[Cache[K, B]]
     }
 
   private val Clients = new ConcurrentHashMap[String, BigtableDataClient]()
 
   implicit def bigtableClient: Resource[BigtableDataClient] =
-    (resourceId, builder) => Clients.computeIfAbsent(resourceId, _ => builder())
-}
-
-class NoOpCache[I, O] extends Cache[I, O] {
-  override def getAllPresent(keys: lang.Iterable[_]): ImmutableMap[I, O] = ImmutableMap.of()
-
-  override def asMap(): ConcurrentMap[I, O] = new ConcurrentHashMap[I, O]()
-
-  override def invalidate(key: scala.Any): Unit = Unit
-
-  override def put(key: I, value: O): Unit = Unit
-
-  override def invalidateAll(keys: lang.Iterable[_]): Unit = Unit
-
-  override def invalidateAll(): Unit = Unit
-
-  override def size(): Long = 0
-
-  override def stats(): CacheStats = new CacheStats(0, 0, 0, 0, 0, 0)
-
-  override def cleanUp(): Unit = Unit
-
-  override def putAll(m: util.Map[_ <: I, _ <: O]): Unit = Unit
-
-  override def get(key: I, loader: Callable[_ <: O]): O = loader.call()
-
-  override def getIfPresent(key: scala.Any): O = null.asInstanceOf[O]
+    (resourceId, builder) => Clients.computeIfAbsent(resourceId, _ => builder)
 }
